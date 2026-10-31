@@ -133,10 +133,23 @@ const UPDATE_BTN: &str = r#"(function(){if(document.getElementById('v489-upd'))r
 
 fn show_update_btn(app: &AppHandle) { if app.state::<Pending>().0.lock().unwrap().is_some() { if let Some(w) = app.get_webview_window("main") { let _ = w.eval(UPDATE_BTN); } } }
 
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+/// Runs right before the updater spawns the NSIS installer and calls process::exit(0).
+/// Tear down the tray, every webview (WebView2 child processes) and the audio loop so nothing is
+/// still holding V489.exe when the installer checks for running instances ("Failed to kill" fix).
+fn before_update_exit() {
+    let Some(app) = APP.get() else { return };
+    STOP_AUDIO.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = app.remove_tray_by_id("main");
+    for (_, w) in app.webview_windows() { let _ = w.destroy(); }
+    std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
 /// Install the pending update (NSIS passive) and relaunch. No-op if none.
 fn apply_update(app: &AppHandle) -> bool {
     let p = app.state::<Pending>().0.lock().unwrap().take();
-    if let Some((u, bytes)) = p { if u.install(bytes).is_ok() { app.restart(); } }
+    if let Some((u, bytes)) = p { if u.install(bytes).is_ok() { app.restart(); } return true; }
     false
 }
 
@@ -173,6 +186,8 @@ fn toggle_float(app: &AppHandle) -> bool {
 }
 
 /// WASAPI loopback (Windows): capture what the PC is playing, push bass level + beat pulses to the studio windows.
+static STOP_AUDIO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn start_audio(app: AppHandle) {
     let bass = Arc::new(AtomicU32::new(0)); let beat = Arc::new(AtomicU32::new(0));
     let (b2, k2) = (bass.clone(), beat.clone());
@@ -189,10 +204,11 @@ fn start_audio(app: AppHandle) {
             avg = avg * 0.995 + env * 0.005; let lvl = (env * 3.0).min(1.0);
             b2.store(lvl.to_bits(), Ordering::Relaxed); if env > avg * 1.35 && lvl > 0.2 { k2.store(1.0f32.to_bits(), Ordering::Relaxed); }
         }, |e| eprintln!("audio: {e}"), None);
-        if let Ok(s) = stream { let _ = s.play(); loop { std::thread::park(); } }
+        if let Ok(s) = stream { let _ = s.play(); while !STOP_AUDIO.load(Ordering::SeqCst) { std::thread::park_timeout(std::time::Duration::from_millis(200)); } drop(s); }
     });
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(33));
+        if STOP_AUDIO.load(Ordering::SeqCst) { break; }
         let b = f32::from_bits(bass.load(Ordering::Relaxed)); let k = f32::from_bits(beat.swap(0, Ordering::Relaxed));
         for l in ["wall", "float", "main"] { if let Some(w) = app.get_webview_window(l) { let _ = w.emit("pc-audio", Level { bass: b, beat: k }); } }
     });
@@ -204,13 +220,14 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AuthState::default())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().on_before_exit(before_update_exit).build())
         .manage(Pending::default())
         .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_login(w.app_handle()); return false; } if w.label() == "main" && url.as_str().starts_with("https://v489.app/__v489_") && !url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle(); match url.path() { "/__v489_login" => start_login(a), "/__v489_cancel" => cancel_login(a), "/__v489_browser" => fallback_to_browser(a), _ => {} } return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
             let h = app.handle().clone();
+            let _ = APP.set(h.clone());
             let auto_on = app.autolaunch().is_enabled().unwrap_or(false);
             let open = MenuItem::with_id(app, "open", "Open V489", true, None::<&str>)?;
             let wall = CheckMenuItem::with_id(app, "wall", "Studio wallpaper (behind icons)", true, false, None::<&str>)?;
@@ -227,7 +244,7 @@ fn main() {
                     "float" => { let on = toggle_float(app); let _ = float2.set_checked(on); }
                     "autostart" => { let m = app.autolaunch(); let on = !m.is_enabled().unwrap_or(false); let _ = if on { m.enable() } else { m.disable() }; let _ = auto2.set_checked(m.is_enabled().unwrap_or(on)); }
                     "update" => { apply_update(app); }
-                    "quit" => { apply_update(app); app.exit(0) }
+                    "quit" => { if !apply_update(app) { app.exit(0) } }
                     _ => {}
                 }).build(app)?;
             if std::env::args().any(|a| a == "--tray") { if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); } }
