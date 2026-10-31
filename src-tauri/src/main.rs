@@ -9,8 +9,8 @@ use tauri_plugin_updater::UpdaterExt;
 /// A downloaded-but-not-installed update (signed, verified by the updater plugin).
 #[derive(Default)]
 struct Pending(std::sync::Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
-/// Desktop Discord sign-in: the app never signs in inside the webview. It opens the system browser (which can hand off
-/// to the installed Discord app), the site mints a one-time code bound to our random `state`, and returns via v489://auth.
+/// Desktop Discord sign-in: the app never signs in inside the webview. It asks the running Discord client (local IPC
+/// AUTHORIZE); if that fails it opens the system browser. Either way the site mints a one-time code bound to our random `state`, and returns via v489://auth.
 #[derive(Default)]
 struct AuthState(std::sync::Mutex<Option<String>>);
 const SITE: &str = "https://v489.app";
@@ -20,12 +20,98 @@ fn is_login_nav(u: &url::Url) -> bool {
     ((h == "discord.com" || h.ends_with(".discord.com")) && u.path().contains("/oauth2/authorize")) || (h == "v489.app" && u.path().starts_with("/api/auth/signin/discord"))
 }
 
-fn start_browser_login(app: &AppHandle) {
+/// Overlay shown while a sign-in is pending. Always has Cancel + Try again and a 2-minute timeout, so the page can never get stuck.
+fn login_overlay(app: &AppHandle, msg: &str) {
+    let Some(w) = app.get_webview_window("main") else { return };
+    let js = r#"(function(M){clearTimeout(window.__v489t);var d=document.getElementById('v489-login')||document.createElement('div');d.id='v489-login';d.style.cssText='position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;background:rgba(5,5,7,.94);color:#d8d8e4;font:15px system-ui;text-align:center';
+var B='margin:8px 4px 0;border:0;border-radius:8px;padding:9px 16px;cursor:pointer;font:600 14px system-ui;';
+d.innerHTML='<div><div style="font:900 26px system-ui;letter-spacing:.3em;color:#ff2e4d">V489</div><p id=v489m></p><p style="color:#6a6a7c;font-size:12px">Nothing happening? Hit Try again.</p><button id=v489r style="'+B+'background:#5865F2;color:#fff">Try again</button><button id=v489c style="'+B+'background:#222;color:#ddd">Cancel</button></div>';
+if(!d.parentNode)document.body.appendChild(d);d.querySelector('#v489m').textContent=M;
+d.querySelector('#v489r').onclick=function(){location.href='https://v489.app/__v489_login'};
+d.querySelector('#v489c').onclick=function(){clearTimeout(window.__v489t);location.href='https://v489.app/__v489_cancel'};
+window.__v489t=setTimeout(function(){var m=document.getElementById('v489m');if(m)m.textContent='Sign-in timed out. Try again?'},120000);})("#;
+    let _ = w.eval(&format!("{js}{});", serde_json::to_string(msg).unwrap_or_default()));
+}
+
+/// Every click starts a FRESH login: new state replaces any pending one (late results from an old attempt are ignored).
+fn start_login(app: &AppHandle) {
     let state = uuid::Uuid::new_v4().simple().to_string();
     *app.state::<AuthState>().0.lock().unwrap() = Some(state.clone());
+    login_overlay(app, "Approve V489 in your Discord app…");
+    let a = app.clone();
+    std::thread::spawn(move || {
+        match discord_ipc::authorize(&a, &state) {
+            Ok(code) => {
+                if a.state::<AuthState>().0.lock().unwrap().as_deref() != Some(state.as_str()) { return; }
+                // Exchange happens server-side; the Discord code goes in a same-origin POST body, never a URL.
+                if let Some(w) = a.get_webview_window("main") {
+                    let js = format!(r#"(function(c,s){{fetch('/api/desktop-auth/rpc',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{code:c,state:s}})}}).then(function(r){{return r.ok?r.json():Promise.reject()}}).then(function(j){{location.replace('/desktop-auth/redeem#code='+encodeURIComponent(j.code)+'&state='+encodeURIComponent(s))}}).catch(function(){{location.href='https://v489.app/__v489_browser'}})}})({},{});"#, serde_json::to_string(&code).unwrap(), serde_json::to_string(&state).unwrap());
+                    let _ = w.eval(&js);
+                }
+            }
+            Err(_) => {
+                if a.state::<AuthState>().0.lock().unwrap().as_deref() != Some(state.as_str()) { return; }
+                browser_login(&a, &state);
+            }
+        }
+    });
+}
+
+/// Fallback: system browser (Discord web) -> one-time code -> v489://auth.
+fn browser_login(app: &AppHandle, state: &str) {
     use tauri_plugin_opener::OpenerExt;
     let _ = app.opener().open_url(format!("{SITE}/api/desktop-auth/start?state={state}"), None::<&str>);
-    if let Some(w) = app.get_webview_window("main") { let _ = w.eval(r#"(function(){var d=document.getElementById('v489-login')||document.createElement('div');d.id='v489-login';d.style.cssText='position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;background:rgba(5,5,7,.92);color:#d8d8e4;font:15px system-ui;text-align:center';d.innerHTML='<div><div style="font:900 26px system-ui;letter-spacing:.3em;color:#ff2e4d">V489</div><p>Finish signing in with Discord in your browser.</p><p style="color:#6a6a7c;font-size:12px">You'll come right back here.</p><button onclick="this.parentNode.parentNode.remove()" style="margin-top:8px;background:#222;color:#ddd;border:0;border-radius:8px;padding:8px 14px">Cancel</button></div>';document.body.appendChild(d)})();"#); }
+    login_overlay(app, "Discord app not available. Finish signing in in your browser, then come back here.");
+}
+
+fn fallback_to_browser(app: &AppHandle) {
+    let st = app.state::<AuthState>().0.lock().unwrap().clone();
+    match st { Some(s) => browser_login(app, &s), None => start_login(app) }
+}
+
+fn cancel_login(app: &AppHandle) {
+    *app.state::<AuthState>().0.lock().unwrap() = None;
+    if let Some(w) = app.get_webview_window("main") { if let Ok(u) = SITE.parse() { let _ = w.navigate(u); } }
+}
+
+/// Discord local IPC (\\.\pipe\discord-ipc-N): handshake + AUTHORIZE shows the authorize modal inside the Discord client.
+mod discord_ipc {
+    use std::io::{Read, Write};
+    use tauri::AppHandle;
+    fn frame(op: u32, v: &serde_json::Value) -> Vec<u8> { let b = v.to_string().into_bytes(); let mut o = op.to_le_bytes().to_vec(); o.extend((b.len() as u32).to_le_bytes()); o.extend(b); o }
+    fn read(p: &mut std::fs::File) -> Result<(u32, serde_json::Value), String> {
+        let mut h = [0u8; 8]; p.read_exact(&mut h).map_err(|e| e.to_string())?;
+        let op = u32::from_le_bytes(h[0..4].try_into().unwrap()); let n = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
+        if n > 1 << 20 { return Err("frame".into()); }
+        let mut b = vec![0u8; n]; p.read_exact(&mut b).map_err(|e| e.to_string())?;
+        Ok((op, serde_json::from_slice(&b).map_err(|e| e.to_string())?))
+    }
+    fn client_id() -> Result<String, String> {
+        let r = ureq::get(&format!("{}/api/desktop-auth/rpc", super::SITE)).call().map_err(|e| e.to_string())?;
+        let j: serde_json::Value = r.into_json().map_err(|e| e.to_string())?;
+        j["clientId"].as_str().map(String::from).ok_or("no client id".into())
+    }
+    #[cfg(windows)]
+    fn open() -> Result<std::fs::File, String> {
+        for i in 0..10 { if let Ok(f) = std::fs::OpenOptions::new().read(true).write(true).open(format!(r"\\.\pipe\discord-ipc-{i}")) { return Ok(f); } }
+        Err("discord not running".into())
+    }
+    #[cfg(not(windows))]
+    fn open() -> Result<std::fs::File, String> { Err("unsupported".into()) }
+    pub fn authorize(_app: &AppHandle, state: &str) -> Result<String, String> {
+        let mut p = open()?; let cid = client_id()?;
+        p.write_all(&frame(0, &serde_json::json!({"v":1,"client_id":cid}))).map_err(|e| e.to_string())?;
+        let (_, ready) = read(&mut p)?; if ready["evt"] != "READY" { return Err(format!("handshake: {ready}")); }
+        let nonce = uuid::Uuid::new_v4().to_string();
+        p.write_all(&frame(1, &serde_json::json!({"cmd":"AUTHORIZE","nonce":nonce,"args":{"client_id":cid,"scopes":["identify","guilds","guilds.members.read"],"state":state}}))).map_err(|e| e.to_string())?;
+        loop { // blocks while the user looks at the modal; a stale result is discarded by the caller's state check
+            let (op, m) = read(&mut p)?;
+            if op == 2 { return Err("closed".into()); }
+            if m["nonce"] != nonce.as_str() { continue; }
+            if m["evt"] == "ERROR" { return Err(m["data"]["message"].as_str().unwrap_or("error").into()); }
+            return m["data"]["code"].as_str().map(String::from).ok_or("no code".into());
+        }
+    }
 }
 
 fn handle_deep_link(app: &AppHandle, raw: &str) {
@@ -120,7 +206,7 @@ fn main() {
         .manage(AuthState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Pending::default())
-        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_browser_login(w.app_handle()); return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
+        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_login(w.app_handle()); return false; } if w.label() == "main" && url.as_str().starts_with("https://v489.app/__v489_") && !url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle(); match url.path() { "/__v489_login" => start_login(a), "/__v489_cancel" => cancel_login(a), "/__v489_browser" => fallback_to_browser(a), _ => {} } return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
