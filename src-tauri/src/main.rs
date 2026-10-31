@@ -9,6 +9,39 @@ use tauri_plugin_updater::UpdaterExt;
 /// A downloaded-but-not-installed update (signed, verified by the updater plugin).
 #[derive(Default)]
 struct Pending(std::sync::Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
+/// Desktop Discord sign-in: the app never signs in inside the webview. It opens the system browser (which can hand off
+/// to the installed Discord app), the site mints a one-time code bound to our random `state`, and returns via v489://auth.
+#[derive(Default)]
+struct AuthState(std::sync::Mutex<Option<String>>);
+const SITE: &str = "https://v489.app";
+
+fn is_login_nav(u: &url::Url) -> bool {
+    let h = u.host_str().unwrap_or("");
+    ((h == "discord.com" || h.ends_with(".discord.com")) && u.path().contains("/oauth2/authorize")) || (h == "v489.app" && u.path().starts_with("/api/auth/signin/discord"))
+}
+
+fn start_browser_login(app: &AppHandle) {
+    let state = uuid::Uuid::new_v4().simple().to_string();
+    *app.state::<AuthState>().0.lock().unwrap() = Some(state.clone());
+    use tauri_plugin_opener::OpenerExt;
+    let _ = app.opener().open_url(format!("{SITE}/api/desktop-auth/start?state={state}"), None::<&str>);
+    if let Some(w) = app.get_webview_window("main") { let _ = w.eval(r#"(function(){var d=document.getElementById('v489-login')||document.createElement('div');d.id='v489-login';d.style.cssText='position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;background:rgba(5,5,7,.92);color:#d8d8e4;font:15px system-ui;text-align:center';d.innerHTML='<div><div style="font:900 26px system-ui;letter-spacing:.3em;color:#ff2e4d">V489</div><p>Finish signing in with Discord in your browser.</p><p style="color:#6a6a7c;font-size:12px">You'll come right back here.</p><button onclick="this.parentNode.parentNode.remove()" style="margin-top:8px;background:#222;color:#ddd;border:0;border-radius:8px;padding:8px 14px">Cancel</button></div>';document.body.appendChild(d)})();"#); }
+}
+
+fn handle_deep_link(app: &AppHandle, raw: &str) {
+    let Ok(u) = url::Url::parse(raw) else { return };
+    if u.scheme() != "v489" || u.host_str() != Some("auth") { return; }
+    let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+    let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else { return };
+    let want = app.state::<AuthState>().0.lock().unwrap().take();
+    if want.as_deref() != Some(state.as_str()) { return; } // not a login we started: ignore (blocks login-CSRF)
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+    if let Some(w) = app.get_webview_window("main") {
+        if let Ok(dest) = format!("{SITE}/desktop-auth/redeem#code={}&state={}", enc(code), enc(state)).parse() { let _ = w.navigate(dest); }
+        open_main(app);
+    }
+}
+
 const UPDATE_URL: &str = "https://v489.app/__v489_update";
 const UPDATE_BTN: &str = r#"(function(){if(document.getElementById('v489-upd'))return;var b=document.createElement('a');b.id='v489-upd';b.href='https://v489.app/__v489_update';b.textContent='\u21BB Update ready \u2014 restart';b.style.cssText='position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#ff2e4d;color:#fff;font:600 13px system-ui;padding:10px 14px;border-radius:10px;box-shadow:0 6px 24px rgba(255,46,77,.5);text-decoration:none';document.body.appendChild(b);})();"#;
 
@@ -81,10 +114,13 @@ fn start_audio(app: AppHandle) {
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| open_main(app)))
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _| { for a in argv.iter() { if a.starts_with("v489://") { handle_deep_link(app, &a); } } open_main(app); }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_opener::init())
+        .manage(AuthState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Pending::default())
-        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
+        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_browser_login(w.app_handle()); return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
@@ -110,6 +146,13 @@ fn main() {
                 }).build(app)?;
             if std::env::args().any(|a| a == "--tray") { if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); } }
             // intercept the injected Update button: navigation to UPDATE_URL restarts into the new version
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                #[cfg(windows)] let _ = app.deep_link().register_all();
+                let h2 = h.clone(); app.deep_link().on_open_url(move |e| { for u in e.urls() { handle_deep_link(&h2, u.as_str()); } });
+                if let Ok(Some(us)) = app.deep_link().get_current() { for u in us { handle_deep_link(&h, u.as_str()); } }
+                for a in std::env::args() { if a.starts_with("v489://") { handle_deep_link(&h, &a); } }
+            }
             start_updater(h.clone());
             start_audio(h);
             Ok(())

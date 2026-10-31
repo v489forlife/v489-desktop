@@ -17,3 +17,10 @@ Local (on Windows): `npm install && npx tauri build`.
 
 ## Auto-updates
 The app checks GitHub Releases (`latest.json`, signed with the Tauri updater key) on launch and every 30 min, downloads in the background, and installs on restart/quit. When an update is ready an **Update ready, restart** button appears in the app and in the tray. The site itself is live, so site changes are instant; updates are only for the desktop shell.
+
+## Sign-in
+Discord login never happens inside the app webview. The app opens your browser, which can hand off to the Discord app.
+The site mints a one-time code, valid for 120 s and bound to a random `state` the app generated, and sends you back through `v489://auth`. The app then redeems the code in its own window. No token ever appears in a URL.
+
+## Splash
+`dist/index.html` is a branded loading screen. It shows an offline state with a retry button and auto-retries every 10 s.
