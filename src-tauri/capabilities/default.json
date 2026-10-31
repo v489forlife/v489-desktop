@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Lets v489.app pages receive PC-audio levels. Nothing else is exposed to the site.",
+  "windows": ["main", "wall", "float"],
+  "remote": { "urls": ["https://v489.app/*"] },
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}
