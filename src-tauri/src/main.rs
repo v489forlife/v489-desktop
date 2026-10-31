@@ -135,29 +135,32 @@ fn show_update_btn(app: &AppHandle) { if app.state::<Pending>().0.lock().unwrap(
 
 static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
-/// Runs right before the updater spawns the NSIS installer and calls process::exit(0).
-/// Tear down the tray, every webview (WebView2 child processes) and the audio loop so nothing is
-/// still holding V489.exe when the installer checks for running instances ("Failed to kill" fix).
+/// Runs (via UpdaterBuilder::on_before_exit) right before the updater spawns the NSIS installer and calls process::exit(0).
+/// Only stops the audio loop and drops the tray. It must NOT destroy the windows: closing the last window makes Tauri
+/// exit the app before the installer is launched (that was the "Update ready just closes the app" bug in <=0.4.2).
 fn before_update_exit() {
     let Some(app) = APP.get() else { return };
     STOP_AUDIO.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = app.remove_tray_by_id("main");
-    for (_, w) in app.webview_windows() { let _ = w.destroy(); }
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    for (_, w) in app.webview_windows() { let _ = w.hide(); }
+    std::thread::sleep(std::time::Duration::from_millis(250));
 }
 
-/// Install the pending update (NSIS passive) and relaunch. No-op if none.
+/// Install the pending update. On Windows the updater launches the NSIS installer (passive: progress bar, then it
+/// relaunches V489) and exits this process itself. Runs on the main thread so nothing races the exit. No-op if none.
 fn apply_update(app: &AppHandle) -> bool {
     let p = app.state::<Pending>().0.lock().unwrap().take();
-    if let Some((u, bytes)) = p { before_update_exit(); let _ = u.install(bytes); app.restart(); }
-    false
+    let Some((u, bytes)) = p else { return false };
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || { if u.install(bytes).is_err() { a.restart(); } });
+    true
 }
 
 /// Check now, then every 30 min. Downloads in the background; installs on restart/quit or when the user clicks Update.
 fn start_updater(app: AppHandle) {
     tauri::async_runtime::spawn(async move { loop {
         let have = app.state::<Pending>().0.lock().unwrap().is_some();
-        if !have { if let Ok(up) = app.updater() { if let Ok(Some(u)) = up.check().await { if let Ok(bytes) = u.download(|_, _| {}, || {}).await {
+        if !have { if let Ok(up) = app.updater_builder().on_before_exit(before_update_exit).build() { if let Ok(Some(u)) = up.check().await { if let Ok(bytes) = u.download(|_, _| {}, || {}).await {
             *app.state::<Pending>().0.lock().unwrap() = Some((u, bytes)); show_update_btn(&app);
             if let Some(t) = app.tray_by_id("main") { let _ = t.set_tooltip(Some("V489 — update ready (restart to install)")); }
         } } } }
@@ -222,7 +225,7 @@ fn main() {
         .manage(AuthState::default())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Pending::default())
-        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_login(w.app_handle()); return false; } if w.label() == "main" && url.as_str().starts_with("https://v489.app/__v489_") && !url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle(); match url.path() { "/__v489_login" => start_login(a), "/__v489_cancel" => cancel_login(a), "/__v489_browser" => fallback_to_browser(a), _ => {} } return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
+        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_login(w.app_handle()); return false; } if w.label() == "main" && url.as_str().starts_with("https://v489.app/__v489_") && !url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle(); match url.path() { "/__v489_login" => start_login(a), "/__v489_cancel" => cancel_login(a), "/__v489_browser" => fallback_to_browser(a), _ => {} } return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); apply_update(&a); return false; } true }).build())
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
