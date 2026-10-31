@@ -234,17 +234,36 @@ fn main() {
             if let Some(cfg) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() {
                 WebviewWindowBuilder::from_config(app, &cfg)?.on_download(|wv, ev| {
                     match ev {
+                        // Download into a private temp folder first, then (outside WebView2's event callback, so no
+                        // nested-modal reentrancy) ask "Save As" like a browser. Cancel deletes the temp file.
                         tauri::webview::DownloadEvent::Requested { destination, .. } => {
                             let name = destination.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "V489-download".into());
-                            if let Ok(dir) = wv.app_handle().path().download_dir() {
-                                let mut p = dir.join(&name);
-                                let (stem, ext) = (p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
-                                let mut i = 1; while p.exists() { p = dir.join(format!("{stem} ({i}){ext}")); i += 1; }
-                                *destination = p;
-                            }
+                            let dir = std::env::temp_dir().join("V489-downloads").join(uuid::Uuid::new_v4().to_string());
+                            let _ = std::fs::create_dir_all(&dir);
+                            *destination = dir.join(name);
                         }
                         tauri::webview::DownloadEvent::Finished { path, success, .. } => {
-                            if success { if let Some(p) = path { let _ = tauri_plugin_opener::reveal_item_in_dir(p); } }
+                            if let Some(tmp) = path {
+                                if !success { let _ = std::fs::remove_file(&tmp); return true; }
+                                let app = wv.app_handle().clone();
+                                let dl = app.path().download_dir().ok();
+                                let _ = app.run_on_main_thread(move || {
+                                    let name = tmp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                                    let mut d = rfd::FileDialog::new().set_title("Save sample").set_file_name(&name);
+                                    if let Some(dir) = dl { d = d.set_directory(dir); }
+                                    if let Some(ext) = tmp.extension().map(|e| e.to_string_lossy().into_owned()) { d = d.add_filter(ext.to_uppercase(), &[ext.as_str()]); }
+                                    if let Some(w) = APP.get().and_then(|a| a.get_webview_window("main")) { d = d.set_parent(&w); }
+                                    match d.save_file() {
+                                        Some(dest) => {
+                                            let _ = std::fs::remove_file(&dest);
+                                            let ok = std::fs::rename(&tmp, &dest).is_ok() || (std::fs::copy(&tmp, &dest).is_ok() && std::fs::remove_file(&tmp).is_ok());
+                                            if ok { let _ = tauri_plugin_opener::reveal_item_in_dir(&dest); }
+                                        }
+                                        None => { let _ = std::fs::remove_file(&tmp); }
+                                    }
+                                    if let Some(parent) = tmp.parent() { let _ = std::fs::remove_dir(parent); }
+                                });
+                            }
                         }
                         _ => {}
                     }
