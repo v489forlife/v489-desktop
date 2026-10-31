@@ -149,7 +149,7 @@ fn before_update_exit() {
 /// Install the pending update (NSIS passive) and relaunch. No-op if none.
 fn apply_update(app: &AppHandle) -> bool {
     let p = app.state::<Pending>().0.lock().unwrap().take();
-    if let Some((u, bytes)) = p { if u.install(bytes).is_ok() { app.restart(); } return true; }
+    if let Some((u, bytes)) = p { before_update_exit(); let _ = u.install(bytes); app.restart(); }
     false
 }
 
@@ -220,7 +220,7 @@ fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AuthState::default())
-        .plugin(tauri_plugin_updater::Builder::new().on_before_exit(before_update_exit).build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Pending::default())
         .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if w.label() == "main" && is_login_nav(url) { start_login(w.app_handle()); return false; } if w.label() == "main" && url.as_str().starts_with("https://v489.app/__v489_") && !url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle(); match url.path() { "/__v489_login" => start_login(a), "/__v489_cancel" => cancel_login(a), "/__v489_browser" => fallback_to_browser(a), _ => {} } return false; } if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
