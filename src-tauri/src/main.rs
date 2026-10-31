@@ -226,6 +226,28 @@ fn main() {
         .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
+            // Main window is built here (create:false in tauri.conf) so it gets a download handler:
+            // WebView2 shows nothing for downloads in this host, so "Download sample" looked dead.
+            if let Some(cfg) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() {
+                WebviewWindowBuilder::from_config(app, &cfg)?.on_download(|wv, ev| {
+                    match ev {
+                        tauri::webview::DownloadEvent::Requested { destination, .. } => {
+                            let name = destination.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "V489-download".into());
+                            if let Ok(dir) = wv.app_handle().path().download_dir() {
+                                let mut p = dir.join(&name);
+                                let (stem, ext) = (p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+                                let mut i = 1; while p.exists() { p = dir.join(format!("{stem} ({i}){ext}")); i += 1; }
+                                *destination = p;
+                            }
+                        }
+                        tauri::webview::DownloadEvent::Finished { path, success, .. } => {
+                            if success { if let Some(p) = path { let _ = tauri_plugin_opener::reveal_item_in_dir(p); } }
+                        }
+                        _ => {}
+                    }
+                    true
+                }).build()?;
+            }
             let h = app.handle().clone();
             let _ = APP.set(h.clone());
             let auto_on = app.autolaunch().is_enabled().unwrap_or(false);
