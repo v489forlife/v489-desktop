@@ -15,12 +15,23 @@ jobs:
         with: { workspaces: "src-tauri -> target" }
       - run: npm install
       - uses: tauri-apps/tauri-action@v0
-        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "V489 Desktop ${{ github.ref_name }} (beta, unsigned)"
+          releaseName: "V489 Desktop ${{ github.ref_name }} (beta)"
           releaseBody: |
             Windows x64 installer. Unsigned beta: Windows SmartScreen will warn; click "More info" → "Run anyway".
             Tray menu: Studio wallpaper (behind icons), Floating studio, Start with Windows.
           releaseDraft: false
-          prerelease: true
+          prerelease: false
+          includeUpdaterJson: true
+      - name: Stable one-click asset (V489-Setup.exe)
+        shell: bash
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          f=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -1)
+          cp "$f" V489-Setup.exe
+          gh release upload "${{ github.ref_name }}" V489-Setup.exe --clobber

@@ -4,6 +4,34 @@
 use std::sync::{atomic::{AtomicU32, Ordering}, Arc};
 use tauri::{menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem}, tray::TrayIconBuilder, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
+use tauri_plugin_updater::UpdaterExt;
+
+/// A downloaded-but-not-installed update (signed, verified by the updater plugin).
+#[derive(Default)]
+struct Pending(std::sync::Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>);
+const UPDATE_URL: &str = "https://v489.app/__v489_update";
+const UPDATE_BTN: &str = r#"(function(){if(document.getElementById('v489-upd'))return;var b=document.createElement('a');b.id='v489-upd';b.href='https://v489.app/__v489_update';b.textContent='\u21BB Update ready \u2014 restart';b.style.cssText='position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#ff2e4d;color:#fff;font:600 13px system-ui;padding:10px 14px;border-radius:10px;box-shadow:0 6px 24px rgba(255,46,77,.5);text-decoration:none';document.body.appendChild(b);})();"#;
+
+fn show_update_btn(app: &AppHandle) { if app.state::<Pending>().0.lock().unwrap().is_some() { if let Some(w) = app.get_webview_window("main") { let _ = w.eval(UPDATE_BTN); } } }
+
+/// Install the pending update (NSIS passive) and relaunch. No-op if none.
+fn apply_update(app: &AppHandle) -> bool {
+    let p = app.state::<Pending>().0.lock().unwrap().take();
+    if let Some((u, bytes)) = p { if u.install(bytes).is_ok() { app.restart(); } }
+    false
+}
+
+/// Check now, then every 30 min. Downloads in the background; installs on restart/quit or when the user clicks Update.
+fn start_updater(app: AppHandle) {
+    tauri::async_runtime::spawn(async move { loop {
+        let have = app.state::<Pending>().0.lock().unwrap().is_some();
+        if !have { if let Ok(up) = app.updater() { if let Ok(Some(u)) = up.check().await { if let Ok(bytes) = u.download(|_, _| {}, || {}).await {
+            *app.state::<Pending>().0.lock().unwrap() = Some((u, bytes)); show_update_btn(&app);
+            if let Some(t) = app.tray_by_id("main") { let _ = t.set_tooltip(Some("V489 — update ready (restart to install)")); }
+        } } } }
+        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+    } });
+}
 
 const WALL_URL: &str = "https://v489.app/studio-wall";
 
@@ -54,6 +82,10 @@ fn start_audio(app: AppHandle) {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| open_main(app)))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(Pending::default())
+        .plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("v489-update-nav").on_navigation(|w, url| { if url.as_str().starts_with(UPDATE_URL) { let a = w.app_handle().clone(); std::thread::spawn(move || { apply_update(&a); }); return false; } true }).build())
+        .on_page_load(|w, _| { if w.label() == "main" { show_update_btn(w.app_handle()); } })
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--tray"])))
         .setup(|app| {
             let h = app.handle().clone();
@@ -63,18 +95,22 @@ fn main() {
             let float = CheckMenuItem::with_id(app, "float", "Floating studio (always on top)", true, false, None::<&str>)?;
             let auto = CheckMenuItem::with_id(app, "autostart", "Start with Windows", true, auto_on, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &PredefinedMenuItem::separator(app)?, &wall, &float, &auto, &PredefinedMenuItem::separator(app)?, &quit])?;
+            let upd = MenuItem::with_id(app, "update", "Restart to update (if ready)", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &PredefinedMenuItem::separator(app)?, &wall, &float, &auto, &PredefinedMenuItem::separator(app)?, &upd, &quit])?;
             let (wall2, float2, auto2) = (wall.clone(), float.clone(), auto.clone());
-            TrayIconBuilder::new().icon(app.default_window_icon().unwrap().clone()).tooltip("V489").menu(&menu)
+            TrayIconBuilder::with_id("main").icon(app.default_window_icon().unwrap().clone()).tooltip("V489").menu(&menu)
                 .on_menu_event(move |app, e| match e.id.as_ref() {
                     "open" => open_main(app),
                     "wall" => { let on = toggle_wall(app); let _ = wall2.set_checked(on); }
                     "float" => { let on = toggle_float(app); let _ = float2.set_checked(on); }
                     "autostart" => { let m = app.autolaunch(); let on = !m.is_enabled().unwrap_or(false); let _ = if on { m.enable() } else { m.disable() }; let _ = auto2.set_checked(m.is_enabled().unwrap_or(on)); }
-                    "quit" => app.exit(0),
+                    "update" => { apply_update(app); }
+                    "quit" => { apply_update(app); app.exit(0) }
                     _ => {}
                 }).build(app)?;
             if std::env::args().any(|a| a == "--tray") { if let Some(w) = app.get_webview_window("main") { let _ = w.hide(); } }
+            // intercept the injected Update button: navigation to UPDATE_URL restarts into the new version
+            start_updater(h.clone());
             start_audio(h);
             Ok(())
         })
